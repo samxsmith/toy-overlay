@@ -1,0 +1,183 @@
+---
+apiVersion: policy/v1beta1
+kind: PodSecurityPolicy
+metadata:
+  name: psp.overlay.unprivileged
+  annotations:
+    seccomp.security.alpha.kubernetes.io/allowedProfileNames: docker/default
+    seccomp.security.alpha.kubernetes.io/defaultProfileName: docker/default
+    apparmor.security.beta.kubernetes.io/allowedProfileNames: runtime/default
+    apparmor.security.beta.kubernetes.io/defaultProfileName: runtime/default
+spec:
+  privileged: false
+  volumes:
+    - configMap
+    - secret
+    - emptyDir
+    - hostPath
+  allowedHostPaths:
+    - pathPrefix: "/etc/cni/net.d"
+    - pathPrefix: "/run/flannel"
+    - pathPrefix: "/etc/overlay"
+  readOnlyRootFilesystem: false
+  runAsUser:
+    rule: RunAsAny 
+  supplementalGroups:
+    rule: RunAsAny 
+  fsGroup:
+    rule: RunAsAny
+  allowPrivilegeEscalation: false
+  defaultAllowPrivilegeEscalation: false
+  allowedCapabilities: ['NET_ADMIN']
+  defaultAddCapabilities: []
+  requiredDropCapabilities: []
+  hostPID: false
+  hostIPC: false
+  hostNetwork: true
+  hostPorts:
+  - min: 0
+    max: 65535 
+  seLinux:
+    rule: 'RunAsAny'
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: overlay
+rules:
+  - apiGroups: ['extensions']
+    resources: ['podsecuritypolicies']
+    verbs: ['use']
+    resourceNames: ['psp.overlay.unprivileged']
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+    verbs:
+      - list
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: overlay
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: overlay
+subjects:
+- kind: ServiceAccount
+  name: overlay
+  namespace: kube-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: overlay
+  namespace: kube-system
+---
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: cni-config
+  namespace: kube-system
+  labels:
+    tier: node
+    app: overlay
+data:
+  cni-config.json: |
+    {
+      "cniVersion": "0.2.0",
+      "name": "cbr0",
+      "plugins": [
+        {
+          "type": "flannel",
+          "delegate": {
+            "hairpinMode": true,
+            "isDefaultGateway": true
+          }
+        },
+        {
+          "type": "portmap",
+          "capabilities": {
+            "portMappings": true
+          }
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: overlay
+  namespace: kube-system
+  labels:
+    tier: node
+    app: overlay
+spec:
+  selector:
+    matchLabels:
+      app: overlay
+  template:
+    metadata:
+      labels: 
+        tier: node
+        app: overlay
+    spec:
+      hostNetwork: true
+      tolerations:
+      - operator: Exists
+        effect: NoSchedule
+      serviceAccountName: overlay
+      initContainers:
+      - name: configure-the-cni
+        image: samxsmith/toy-overlay:latest
+        command:
+        - cp
+        args:
+        - -f
+        - /etc/overlay/cni-config.json
+        - ~/cni/10-flannel.conflist
+        volumeMounts:
+        - name: cni
+          mountPath: ~/cni
+        - name: flannel-cfg
+          mountPath: /etc/overlay
+      containers:
+      - name: overlay-daemon
+        image: samxsmith/toy-overlay:latest
+        ports:
+        - containerPort: 80
+        securityContext:
+          privileged: false
+          capabilities:
+             add: ["NET_ADMIN"]
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        volumeMounts:
+        - name: run
+          mountPath: /run/flannel
+        - name: flannel-cfg
+          mountPath: /etc/overlay/
+        - name: tundev
+          mountPath: /dev/net/tun
+      volumes:
+        - name: run
+          hostPath: 
+            path: /run/flannel
+        - name: cni
+          hostPath:
+            path: /etc/cni/net.d
+        - name: flannel-cfg
+          configMap:
+            name: cni-config 
+        - name: tundev
+          hostPath:
+            path: /dev/net/tun
+---
